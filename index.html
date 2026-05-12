@@ -13,6 +13,9 @@
   <!-- Leaflet omnivore for KML parsing -->
   <script src="https://api.mapbox.com/mapbox.js/plugins/leaflet-omnivore/v0.3.1/leaflet-omnivore.min.js"></script>
 
+  <!-- Supabase -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+
   <!-- Google Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -723,11 +726,19 @@
 // ════════════════════════════════════════════════════════════
 //  CONFIG
 // ════════════════════════════════════════════════════════════
-const KML_URL = 'https://api.allorigins.win/raw?url=' +
+const KML_URL = 'https://corsproxy.io/?' +
   encodeURIComponent('https://www.google.com/maps/d/u/0/kml?forcekml=1&mid=10ZjeDwOsMnrbiXpU2NSUh3TJUJbvGdw');
 
 const MERIDA_CENTER = [20.9674, -89.6237];
 const REPORT_TTL_MS = 3 * 60 * 60 * 1000; // 3 hours
+
+// ════════════════════════════════════════════════════════════
+//  SUPABASE
+// ════════════════════════════════════════════════════════════
+const SUPABASE_URL = 'https://hnunfwbtwdcwzvwlhxgs.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_9DQXs-1NViwO10wZcCfpjw_8rB_noZ4';
+const { createClient } = window.supabase;
+const db = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ════════════════════════════════════════════════════════════
 //  STATE
@@ -740,53 +751,90 @@ let layers = { apagon: true, agua: true };
 let markers = {};          // reportId → Leaflet marker
 let districtLayers = {};   // seccion → Leaflet polygon layer
 let sidebarOpen = false;
+let cachedReports = [];    // local cache updated by realtime
 
 // ════════════════════════════════════════════════════════════
-//  STORAGE (localStorage — swap with Supabase for production)
+//  STORAGE — Supabase
 // ════════════════════════════════════════════════════════════
-function loadReports() {
+async function loadReports() {
+  const cutoff = Date.now() - REPORT_TTL_MS;
   try {
-    const raw = localStorage.getItem('apagones_reports_v2');
-    const all = raw ? JSON.parse(raw) : [];
-    const now = Date.now();
-    return all.filter(r => !r.resolved && (now - r.timestamp) < REPORT_TTL_MS);
-  } catch { return []; }
-}
-
-function saveReports(reports) {
-  localStorage.setItem('apagones_reports_v2', JSON.stringify(reports));
-}
-
-function addReport(report) {
-  const reports = loadReports();
-  reports.push(report);
-  saveReports(reports);
-  return report;
-}
-
-function resolveReport(id) {
-  const raw = localStorage.getItem('apagones_reports_v2');
-  const all = raw ? JSON.parse(raw) : [];
-  const idx = all.findIndex(r => r.id === id);
-  if (idx >= 0) {
-    all[idx].resolved = true;
-    all[idx].resolvedAt = Date.now();
-    saveReports(all);
+    const { data, error } = await Promise.race([
+      db.from('reports').select('*').eq('resolved', false).gt('timestamp', cutoff).order('timestamp', { ascending: false }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+    ]);
+    if (error) throw error;
+    cachedReports = data || [];
+    return cachedReports;
+  } catch(e) {
+    console.warn('loadReports failed:', e.message);
+    return cachedReports;
   }
 }
 
-function confirmReport(id) {
-  const raw = localStorage.getItem('apagones_reports_v2');
-  const all = raw ? JSON.parse(raw) : [];
-  const idx = all.findIndex(r => r.id === id);
-  if (idx >= 0) {
-    all[idx].confirmations = (all[idx].confirmations || 0) + 1;
-    saveReports(all);
+async function addReport(report) {
+  const { data, error } = await db
+    .from('reports')
+    .insert([{
+      id:            report.id,
+      type:          report.type,
+      lat:           report.lat,
+      lng:           report.lng,
+      seccion:       report.seccion || '',
+      timestamp:     report.timestamp,
+      resolved:      false,
+      resolved_at:   null,
+      confirmations: 0
+    }])
+    .select()
+    .single();
+
+  if (error) {
+    console.error('addReport error:', error);
+    toast('Error al guardar. Intenta de nuevo.', 'warn');
+    return null;
   }
+  return data;
+}
+
+async function resolveReport(id) {
+  const { error } = await db
+    .from('reports')
+    .update({ resolved: true, resolved_at: Date.now() })
+    .eq('id', id);
+  if (error) console.error('resolveReport error:', error);
+}
+
+async function confirmReport(id) {
+  // Increment confirmations safely using RPC or read-modify-write
+  const { data: row } = await db
+    .from('reports').select('confirmations').eq('id', id).single();
+  if (!row) return;
+  await db.from('reports')
+    .update({ confirmations: (row.confirmations || 0) + 1 })
+    .eq('id', id);
 }
 
 function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+// ════════════════════════════════════════════════════════════
+//  REALTIME SUBSCRIPTION
+// ════════════════════════════════════════════════════════════
+function initRealtime() {
+  db.channel('reports-changes')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'reports' },
+      (payload) => {
+        console.log('Realtime:', payload.eventType);
+        renderMarkers(); // refresh on any change
+      })
+    .subscribe((status) => {
+      if (status === 'SUBSCRIBED') {
+        console.log('🔴 Realtime conectado');
+        toast('🔴 En vivo — actualizaciones en tiempo real', 'info');
+      }
+    });
 }
 
 // ════════════════════════════════════════════════════════════
@@ -900,8 +948,7 @@ function loadKMLDistricts() {
 }
 
 // Update district polygon style based on reports
-function updateDistrictStyles() {
-  const reports = loadReports();
+function updateDistrictStyles(reports) {
   const seccionReports = {};
   reports.forEach(r => {
     if (!r.seccion) return;
@@ -976,8 +1023,8 @@ function remainingTime(ts) {
   return hrs > 0 ? `${hrs}h ${m}m restantes` : `${mins}m restantes`;
 }
 
-function renderMarkers() {
-  const reports = loadReports();
+async function renderMarkers() {
+  const reports = await loadReports();
 
   // Remove stale markers
   const currentIds = new Set(reports.map(r => r.id));
@@ -1009,7 +1056,7 @@ function renderMarkers() {
   });
 
   updateCounts(reports);
-  updateDistrictStyles();
+  updateDistrictStyles(reports);
   renderSidebar(reports);
 }
 
@@ -1134,13 +1181,12 @@ function updateSubmitBtn() {
   if (!ready) btn.disabled = true;
 }
 
-function submitReport() {
+async function submitReport() {
   if (!pendingType || pendingLat === null) return;
 
-  // Find which seccion the point falls in (basic bounding box approach)
   const seccion = findSeccionAt(pendingLat, pendingLng);
 
-  const report = addReport({
+  const reportData = {
     id: genId(),
     type: pendingType,
     lat: pendingLat,
@@ -1150,14 +1196,18 @@ function submitReport() {
     resolved: false,
     resolvedAt: null,
     confirmations: 0
-  });
+  };
 
   closeModal();
-  renderMarkers();
+  toast('Enviando reporte...', 'info');
+
+  const report = await addReport(reportData);
+  if (!report) return; // error already shown
+
+  await renderMarkers();
   toast(pendingType === 'apagon' ? '⚡ Apagón reportado' : '💧 Fuga de agua reportada', 'warn');
 
-  // Fly to report
-  map.flyTo([pendingLat, pendingLng], 15, { duration: 1 });
+  map.flyTo([reportData.lat, reportData.lng], 15, { duration: 1 });
   setTimeout(() => {
     if (markers[report.id]) markers[report.id].openPopup();
   }, 1200);
@@ -1194,27 +1244,25 @@ function isPointInPolygon(lat, lng, latlngs) {
 // ════════════════════════════════════════════════════════════
 //  POPUP ACTIONS
 // ════════════════════════════════════════════════════════════
-function handleConfirm(id) {
-  confirmReport(id);
+async function handleConfirm(id) {
+  await confirmReport(id);
   map.closePopup();
-  renderMarkers();
+  await renderMarkers();
   toast('✓ Reporte confirmado', 'success');
-  // Reopen popup with updated info
   setTimeout(() => {
     const m = markers[id];
     if (m) {
-      const reports = loadReports();
-      const r = reports.find(x => x.id === id);
+      const r = cachedReports.find(x => x.id === id);
       if (r) { m.setPopupContent(buildPopup(r)); m.openPopup(); }
     }
-  }, 100);
+  }, 300);
 }
 
-function handleResolve(id) {
-  resolveReport(id);
+async function handleResolve(id) {
+  await resolveReport(id);
   map.closePopup();
   if (markers[id]) { markers[id].remove(); delete markers[id]; }
-  renderMarkers();
+  await renderMarkers();
   toast('✅ Marcado como resuelto', 'success');
 }
 
@@ -1268,9 +1316,8 @@ function renderSidebar(reports) {
     `).join('');
 }
 
-function flyToReport(id) {
-  const reports = loadReports();
-  const r = reports.find(x => x.id === id);
+async function flyToReport(id) {
+  const r = cachedReports.find(x => x.id === id);
   if (r && r.lat) {
     map.flyTo([r.lat, r.lng], 15, { duration: 0.8 });
     setTimeout(() => {
@@ -1316,13 +1363,27 @@ window.addEventListener('DOMContentLoaded', async () => {
   initMap();
   loadKMLDistricts();
 
-  // Small delay for smoother loading experience
-  setTimeout(() => {
-    renderMarkers();
+  // Always hide loading after max 3s no matter what
+  const hideLoading = () => {
     const loading = document.getElementById('loading');
-    loading.classList.add('hidden');
-    setTimeout(() => loading.remove(), 600);
-  }, 1200);
+    if (loading) {
+      loading.classList.add('hidden');
+      setTimeout(() => loading.remove(), 600);
+    }
+  };
+  const fallbackTimer = setTimeout(hideLoading, 3000);
+
+  try {
+    await renderMarkers();
+  } catch(e) {
+    console.warn('renderMarkers error:', e);
+  }
+
+  clearTimeout(fallbackTimer);
+  hideLoading();
+
+  // Init realtime after map is visible
+  try { initRealtime(); } catch(e) { console.warn('Realtime error:', e); }
 });
 </script>
 </body>
